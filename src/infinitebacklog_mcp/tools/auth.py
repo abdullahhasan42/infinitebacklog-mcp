@@ -7,7 +7,7 @@ from ..login import credentials, signed_in_username
 from ..normalize import _dumps
 
 
-async def login(headless: bool = True) -> str:
+async def login(headless: bool | None = None) -> str:
     """Sign in with IB_USERNAME and IB_PASSWORD from the environment.
 
     Types them into the Infinite Backlog login form. If either value is missing,

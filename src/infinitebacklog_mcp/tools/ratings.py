@@ -1,138 +1,96 @@
-"""MCP tools: ratings."""
+"""MCP tools: per-game rating (overall 1-10 plus sub-ratings)."""
 from __future__ import annotations
 
 from typing import Any
 
+from ..api import api_error, ib_api
 from ..browser import _ensure_browser, locked_tool
-from ..js import RESTORE_COLLECTION_STATUS_JS, SET_STAR_RATING_JS, SNAPSHOT_RATINGS_JS
-from ..normalize import _dumps, parse_score, rating_label, score_to_star_event
-from ..pages import _ensure_rating_card, _fetch_ib_api, _resolve_game_context
+from ..normalize import _dumps, parse_score, rating_label, slim_game
+from ..pages import game_context
+
+SUB_FIELDS = {
+    "gameplay": "gameplay",
+    "story": "story",
+    "visual": "visual",
+    "audio": "sound",
+    "sound": "sound",
+    "playability": "accessibility",
+    "accessibility": "accessibility",
+}
+
+
+def _score(value: Any) -> int | None:
+    parsed = parse_score(value)
+    if parsed is None:
+        return None
+    n = int(round(parsed))
+    if n < 1 or n > 10:
+        raise ValueError("Scores are whole numbers from 1 to 10.")
+    return n
+
 
 async def set_game_rating(
     slug: str,
     score: str = "",
     gameplay: str = "",
-    sound: str = "",
     story: str = "",
     visual: str = "",
+    audio: str = "",
     playability: str = "",
     clear: bool = False,
-    wait_ms: int = 3000,
+    collection_id: str = "",
+    wait_ms: int = 0,
 ) -> str:
-    """Set or clear IB ratings on the collection game page (per IGDB game, not per copy). Scores are 1-10. Empty sub-fields stay unchanged. clear=true removes the rating. Requires login."""
+    """Rate a game 1-10 overall, with optional 1-10 sub-ratings for Gameplay, Story, Visual, Audio and Playability. Ratings are per game, not per copy. clear=true removes your rating. Sub-ratings you leave blank keep their current value."""
+    del collection_id, wait_ms
     page = await _ensure_browser()
-    ctx = await _resolve_game_context(page, slug, "", wait_ms)
-    if not ctx.get("game_id"):
-        return _dumps({"error": "game_not_found", "slug": ctx.get("slug")})
-
-    current = await _fetch_ib_api(page, f"/ratings?user_id={ctx['user_id']}&game_id={ctx['game_id']}")
-    existing = current.get("data") if isinstance(current.get("data"), dict) else None
-    if existing and existing.get("errorResponseId"):
-        existing = None
-
-    if clear and not (existing and existing.get("id") and existing.get("score")):
-        return _dumps(
-            {
-                "slug": ctx["slug"],
-                "game_id": ctx["game_id"],
-                "clear": True,
-                "status": "already_empty",
-                "before": existing,
-            }
-        )
-
+    ctx = await game_context(page, slug, need_row=False)
+    if ctx.get("error"):
+        return _dumps(ctx)
+    me, gid = ctx["user"], ctx["game_id"]
+    existing = await ib_api(page, "GET", "/ratings", params={"user_id": me["id"], "game_id": gid})
+    current = existing.get("data") if existing.get("ok") and isinstance(existing.get("data"), dict) else None
+    if clear:
+        if not current or not current.get("id"):
+            return _dumps({"ok": True, "status": "no_rating"})
+        result = await ib_api(page, "DELETE", f"/ratings/{int(current['id'])}")
+        if not result.get("ok"):
+            return _dumps(api_error(result, "clear_rating"))
+        return _dumps({"ok": True, "status": "cleared", "game": slim_game(ctx["game"])})
     try:
-        parsed = {
-            "score": parse_score(score),
-            "gameplay": parse_score(gameplay),
-            "sound": parse_score(sound),
-            "story": parse_score(story),
-            "visual": parse_score(visual),
-            "accessibility": parse_score(playability),
+        values = {
+            "score": _score(score),
+            "gameplay": _score(gameplay),
+            "story": _score(story),
+            "visual": _score(visual),
+            "sound": _score(audio),
+            "accessibility": _score(playability),
         }
-    except ValueError as e:
-        return _dumps({"error": "invalid_score", "detail": str(e)})
-
-    if not clear and all(v is None for v in parsed.values()):
-        return _dumps({"error": "no_scores", "hint": "Pass score and/or sub-ratings as 1-10, or clear=true."})
-    if not clear and parsed["score"] is None and not (existing and existing.get("score")):
-        return _dumps(
-            {
-                "error": "overall_required",
-                "hint": "IB persists sub-ratings only after an overall score exists. Pass score (1-10) first.",
-            }
-        )
-
-    mounted = await _ensure_rating_card(page, ctx, wait_ms)
-    if mounted.get("error"):
-        return _dumps(mounted)
-
-    widgets_before = await page.evaluate(SNAPSHOT_RATINGS_JS)
-    actions: list[dict[str, Any]] = []
-    restore_status = mounted.get("previous_status") if mounted.get("revealed") else None
-
-    try:
-        if clear:
-            result = await page.evaluate(
-                SET_STAR_RATING_JS,
-                {"label": "Overall Rating", "starId": 5, "position": 100, "clear": True},
-            )
-            actions.append(result)
-            await page.wait_for_timeout(800)
-            after = await _fetch_ib_api(page, f"/ratings?user_id={ctx['user_id']}&game_id={ctx['game_id']}")
-            return _dumps(
-                {
-                    "slug": ctx["slug"],
-                    "game_id": ctx["game_id"],
-                    "clear": True,
-                    "before": existing,
-                    "widgets_before": widgets_before,
-                    "actions": actions,
-                    "surface": mounted.get("surface"),
-                    "revealed": mounted.get("revealed"),
-                    "after": after.get("data") if after.get("ok") else after,
-                }
-            )
-
-        for key, label in (
-            ("score", "Overall Rating"),
-            ("visual", "Visual"),
-            ("gameplay", "Gameplay"),
-            ("story", "Story"),
-            ("sound", "Audio"),
-            ("accessibility", "Playability"),
-        ):
-            val = parsed.get(key)
-            if val is None:
-                continue
-            event = score_to_star_event(val)
-            result = await page.evaluate(
-                SET_STAR_RATING_JS,
-                {"label": label, "starId": event["id"], "position": event["position"], "clear": False},
-            )
-            result["requested_score"] = val
-            result["label_text"] = rating_label(val)
-            actions.append(result)
-            await page.wait_for_timeout(500)
-
-        await page.wait_for_timeout(800)
-        after = await _fetch_ib_api(page, f"/ratings?user_id={ctx['user_id']}&game_id={ctx['game_id']}")
-        widgets_after = await page.evaluate(SNAPSHOT_RATINGS_JS)
-        return _dumps(
-            {
-                "slug": ctx["slug"],
-                "game_id": ctx["game_id"],
-                "before": existing,
-                "actions": actions,
-                "surface": mounted.get("surface"),
-                "revealed": mounted.get("revealed"),
-                "after": after.get("data") if after.get("ok") else after,
-                "widgets_after": widgets_after,
-            }
-        )
-    finally:
-        if restore_status:
-            await page.evaluate(RESTORE_COLLECTION_STATUS_JS, {"status": restore_status})
+    except ValueError as exc:
+        return _dumps({"error": "invalid_score", "hint": str(exc)})
+    if all(v is None for v in values.values()):
+        return _dumps({"error": "nothing_to_change", "current": current})
+    body: dict[str, Any] = {"game_id": gid}
+    for key in values:
+        body[key] = (current or {}).get(key)
+    body.update({k: v for k, v in values.items() if v is not None})
+    if not body.get("score"):
+        return _dumps({"error": "score_required", "hint": "An overall score is required for a new rating."})
+    if current and current.get("id"):
+        result = await ib_api(page, "PUT", f"/ratings/{int(current['id'])}", body=body)
+    else:
+        result = await ib_api(page, "POST", "/ratings", body=body)
+    if not result.get("ok"):
+        return _dumps(api_error(result, "set_game_rating"))
+    saved = result.get("data") or {}
+    return _dumps(
+        {
+            "ok": True,
+            "game": slim_game(ctx["game"]),
+            "rating": {k: saved.get(k) for k in ("id", "score", "gameplay", "story", "visual", "sound", "accessibility")},
+            "label": rating_label(saved.get("score")),
+        }
+    )
 
 
 def register(mcp) -> None:

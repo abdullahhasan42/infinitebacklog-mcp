@@ -1,7 +1,8 @@
 """Sign in through the Infinite Backlog login form.
 
-The form is Keycloak: username or email, password, and a remember-me box.
-This module types those fields. It does not read a browser cookie file.
+IB v2 has a "Sign in" button in the header that opens the same Keycloak form as v1
+(#kc-form-login: username or email, password, remember-me). This module types those
+fields. It does not read a browser cookie file. Signed-in state comes from the API.
 """
 from __future__ import annotations
 
@@ -78,18 +79,21 @@ async def _clear_password(page: Page) -> None:
 
 
 async def signed_in_username(page: Page) -> str:
+    """Username from /api/users/me/complete, or "" when signed out."""
+    from .api import current_user
+
     try:
-        name = await page.evaluate(
-            """() => {
-              const href = [...document.querySelectorAll('a[href^="/users/"]')]
-                .map(el => el.getAttribute('href') || '')
-                .find(h => /^\\/users\\/[^/]+$/.test(h));
-              return href ? href.split('/').pop() : '';
-            }"""
-        )
+        me = await current_user(page, refresh=True)
     except Exception:
         return ""
-    return str(name or "")
+    return str((me or {}).get("username") or "")
+
+
+def _sign_in_button(page: Page):
+    """v2 header button. The v1 nav item is kept as a fallback."""
+    return page.locator("header button:has-text('Sign in'), button:has-text('Sign in'), li.nav-item.login").locator(
+        "visible=true"
+    )
 
 
 async def login_from_env(page: Page) -> dict[str, object]:
@@ -108,11 +112,21 @@ async def login_from_env(page: Page) -> dict[str, object]:
             ),
         )
     try:
+        if getattr(page, "is_http", False):
+            if page.signed_in:
+                current = await signed_in_username(page)
+                if current:
+                    return _public(True, status="already", username=current)
+            result = await page.sign_in_async(username, password)
+            if not result.get("ok"):
+                return {k: result[k] for k in ("ok", "error", "hint") if k in result}
+            current = await signed_in_username(page)
+            return _public(True, status="signed_in", username=current) if current else login_failure(password)
         current = await signed_in_username(page)
         if current:
             return _public(True, status="already", username=current)
         await page.goto(f"{IB_ORIGIN}/", wait_until="domcontentloaded", timeout=60000)
-        visible_login = page.locator("li.nav-item.login >> visible=true")
+        visible_login = _sign_in_button(page)
         try:
             await visible_login.first.wait_for(state="visible", timeout=30000)
         except Exception:
@@ -148,12 +162,7 @@ async def login_from_env(page: Page) -> dict[str, object]:
                     const text = document.body ? document.body.innerText : '';
                     return /invalid username or password|account is disabled|update password/i.test(text);
                   }
-                  const href = [...document.querySelectorAll('a[href^="/users/"]')]
-                    .map(el => el.getAttribute('href') || '')
-                    .find(h => /^\\/users\\/[^/]+$/.test(h));
-                  if (href) return true;
-                  const text = document.body ? document.body.innerText : '';
-                  return /\\bLOG IN\\b/i.test(text) && !location.hash.includes('code=');
+                  return location.hostname.endsWith('infinitebacklog.net') && !location.hash.includes('code=');
                 }""",
                 timeout=30000,
             )

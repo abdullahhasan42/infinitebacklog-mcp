@@ -1,244 +1,242 @@
 ![Infinite Backlog MCP](docs/assets/readme-header.svg)
 
-# Infinite Backlog MCP Server
+# Infinite Backlog MCP
 
-This is a [Model Context Protocol](https://modelcontextprotocol.io/) server for [Infinite Backlog](https://infinitebacklog.net/), the free collection tracker. Infinite Backlog has no public write API, so the tools drive a Playwright Chromium window. After you're signed in, nested extras can still be checked with a read-only `GET /api/user_collections`.
-
-If you're an assistant calling the tools, read [AGENTS.md](AGENTS.md).
+An [MCP](https://modelcontextprotocol.io/) server that lets an AI assistant manage your [Infinite Backlog](https://infinitebacklog.net/) account.
 
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)
 ![MCP](https://img.shields.io/badge/protocol-MCP-555555.svg)
-![Listed on mcpservers.org](https://mcpservers.org/badge.svg)
 
-## Sign in
+## Goals
 
-You sign in once. After that, the same window remembers you. Your Brave, Chrome, or Edge cookies are not used.
+- Let your assistant read and update your Infinite Backlog collection without you clicking through the site.
+- Use the same calls the website makes, so the results match what you see in your account.
+- Stay safe by default: nothing deletes, publishes or posts unless you ask for it.
 
-- **In the window.** Leave the username and password empty. A browser window opens. Sign in there yourself.
-- **In a file.** Copy [.env.example](.env.example) to `.env` in this folder. Put your username or email in `IB_USERNAME`, and your password in `IB_PASSWORD`.
+Built for Infinite Backlog **v2.1.0**. This is an unofficial project, not affiliated with Infinite Backlog. It uses the site's private API, which can change without notice. Check Infinite Backlog's terms before heavy use.
 
-## What you can do
+## What it can do
 
-- Search the game catalog
-- Update your collection
-- Set ratings and write reviews
-- Keep play records
-- Add DLC, packs, and other extras to a game you already own
+- **Catalog:** search games, game info, community stats, DLC and editions, achievements and trophies.
+- **Collection:** add games and platform copies, set status, progress, playtime, notes, details and acquisition.
+- **Ratings and reviews:** overall and sub-ratings, reviews saved as drafts or published.
+- **Play records:** your own notes and checklists per copy (key/values, checklists, progress bars, tables, text).
+- **Playthroughs and sessions:** log playthroughs and play sessions, read your play journal.
+- **Tags:** custom tags on your copies.
+- **Wishlist and lists:** manage your wishlist and your custom lists.
+- **Playtime:** submit time to beat and time to complete, and read what you submitted.
+- **Stats:** your collection, activity and yearly stats.
 
+## What it can't do
 
-
-## Tools
-
-
-
-### Deterministic (always available)
-
-
-| Name                            | Description                                                                                                                             | Key inputs                                                                           |
-| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
-| `open_site`                     | Open an Infinite Backlog path in this server's Playwright window. `headless=false` shows the window so you can sign in once.            | `path`, `wait_ms`, `headless`                                                        |
-| `search_games`                  | Search the games catalog.                                                                                                               | `query`, `wait_ms`                                                                   |
-| `get_page_text`                 | Extract visible page text.                                                                                                              | `max_chars`                                                                          |
-| `get_page_html`                 | Read HTML for a selector (default `body`).                                                                                              | `selector`, `max_chars`                                                              |
-| `get_links`                     | List links on the current page.                                                                                                         | `max_links`                                                                          |
-| `click`                         | Click by CSS selector or `text=...` on an Infinite Backlog page. Blocked for DELETE GAME, DELETE DRAFT, YES/NO, and UNLOCK CUSTOM TAGS. | `selector`, `wait_ms`                                                                |
-| `fill`                          | Fill an input. Refuses password and credential selectors.                                                                               | `selector`, `value`                                                                  |
-| `evaluate_js`                   | Debug-only page JavaScript. Disabled unless `IB_ALLOW_EVAL_JS=true`.                                                                    | `expression`                                                                         |
-| `screenshot`                    | Save a PNG under the OS temp `infinitebacklog-mcp` directory (path is confined).                                                        | `path`, `full_page`                                                                  |
-| `login`                         | Type `IB_USERNAME` and `IB_PASSWORD` into the login form. If either is missing, nothing is typed.                                       | `headless`                                                                           |
-| `current_url`                   | Return the current URL and title.                                                                                                       | none                                                                                 |
-| `close_browser`                 | Close the Playwright window. Brave, Chrome, and Edge stay open.                                                                         | none                                                                                 |
-| `list_related_content`          | List related DLC, packs, editions, and extras on a game page.                                                                           | `game_slug`, `wait_ms`                                                               |
-| `list_collection_content_menus` | Read Add DLC, owned DLC, addon boxes, and GAME EDITION text on an edit form (login required).                                           | `edit_path`, `wait_ms`                                                               |
-| `add_game_content`              | Attach nested extras on the parent edit form. Ticks `addon-*` inputs, not the label.                                                    | `parent_slug`, `names`, `collection_id`                                              |
-| `list_collection_game_options`  | Read copies, extra-platform control, progress, acquisition, ratings, reviews, and Play Records (no save).                               | `slug`, `collection_id`                                                              |
-| `set_game_rating`               | Set or clear 1-10 overall plus Visual / Gameplay / Story / Audio / Playability.                                                         | `slug`, `score`, sub-ratings, `clear`                                                |
-| `add_game_review`               | Draft or publish at `/games/{slug}/add-review`. Publish needs 800+ characters.                                                          | `slug`, `body`, `publish`, `title`                                                   |
-| `delete_game_review`            | Delete a **draft** review. Published reviews are out of scope unless named.                                                             | `slug`, `confirm`, `published`                                                       |
-| `add_game_platform_copy`        | Add another GAME INFORMATION copy via `button.extra-platform`.                                                                          | `slug`, `platform`, `digital`, `submit`                                              |
-| `set_game_progress`             | Set per-copy status, completion, 0-100 bar, and notes.                                                                                  | `slug`, `collection_id`, `status`, `completion`, `progress`, `notes`, `clear_fields` |
-| `set_game_acquisition`          | Set or clear ACQUISITION INFO (type, source, date, amount, costs, notes, Digital Service).                                              | `slug`, `collection_id`, acquisition fields, `clear_fields`                          |
-| `delete_game_copy`              | Delete one saved copy. Clicks the single `DELETE GAME FOR {platform}` button, then YES.                                                 | `collection_id` (required), `confirm=true` (required)                                |
-| `list_play_records`             | Read Play Records categories on `/edit/stats`.                                                                                          | `slug`, `collection_id`                                                              |
-| `set_play_record_category`      | Add a category (`keyValue` / `checkbox` / `progress` / `table`).                                                                        | `slug`, `name`, `type`, `layout`                                                     |
-| `set_play_record`               | Add or update a row inside a category.                                                                                                  | `slug`, `category`, `action`, `name`, `value`                                        |
-| `remove_play_record`            | Remove a row, or a whole category with `confirm=true`.                                                                                  | `slug`, `category`, `row_index`, `confirm`                                           |
-
-
-
-
-### Autonomous (requires `browser-use` and an LLM key)
-
-
-| Name                   | Description                                                                                                                           | Key inputs                               |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
-| `run_browser_use_task` | High-level goal on infinitebacklog.net only. The agent plans and executes with vision plus DOM. Best for multi-step or fragile flows. | `task`, `max_steps`, `model`, `headless` |
-
-
-
-
-## Requirements
-
-- Python 3.11 or newer
-- Playwright Chromium
-- An MCP client (Cursor, Claude Desktop, VS Code, and others)
-- An LLM API key only when using `run_browser_use_task`
-
-
+- Read or click through web pages. Every tool uses the site's API.
+- Change your profile, settings, widgets, friends or feed.
+- Post to the community feed.
+- Publish a list or submit playtimes unless you ask for it.
+- Sign in past a captcha or second factor. You finish those by hand (browser mode) or switch modes.
+- Call any API endpoint that isn't on its allowlist, or open any site other than infinitebacklog.net.
 
 ## Installation
 
-```bash
-cd infinitebacklog-mcp
-python -m venv .venv
-# Windows: .venv\Scripts\activate
-# Unix: source .venv/bin/activate
-pip install -e .
-python -m playwright install chromium
-```
+1. Install Python 3.11 or newer.
+2. Set up the server:
 
-Optional autonomous agent:
+   ```bash
+   cd infinitebacklog-mcp
+   python -m venv .venv
+   .venv\Scripts\activate
+   pip install -e .
+   python -m playwright install chromium   # only for the bundled browser option
+   ```
 
-```bash
-pip install -e ".[agent]"
-```
+3. Copy `.env.example` to `.env` and fill in `IB_USERNAME` (username or email) and `IB_PASSWORD`. The `login` tool uses them. HTTP mode needs them. In a browser mode you can sign in by hand instead. Never commit `.env`.
+4. Add the server to your MCP client:
 
-Copy [.env.example](.env.example) to `.env` and fill in what you need. Don't commit `.env`.
+   ```json
+   {
+     "mcpServers": {
+       "infinitebacklog": {
+         "command": "C:/path/to/infinitebacklog-mcp/.venv/Scripts/python.exe",
+         "args": ["-m", "infinitebacklog_mcp.server"],
+         "cwd": "C:/path/to/infinitebacklog-mcp"
+       }
+     }
+   }
+   ```
 
-## Quick start
+   After `pip install -e .` you can use `"command": "infinitebacklog-mcp"` instead. Logs go to stderr.
 
-After install:
+5. Start your MCP client. The first tool call asks which sign-in mode to use. You can also call `choose_browser` yourself.
+6. Sign in once. In a browser mode, the server signs in with `.env` when the browser first opens, or you can call `login`, or sign in by hand in the window. In HTTP mode, the server signs in with `.env` on the first call. Nothing opens.
+7. Try `search_games` and `list_collection`.
 
-```bash
-infinitebacklog-mcp
-```
+## Sign-in modes
 
-Or as a module:
+Nothing signs in or opens until you choose a mode. The choice lasts until the server stops and is never written to disk. To skip the question, set `IB_BROWSER`.
 
-```bash
-python -m infinitebacklog_mcp.server
-```
+**Browser modes.** A window opens. Sign in there by hand, or let the server fill in `IB_USERNAME` and `IB_PASSWORD`. The session is saved in the server's profile folder and reused. The window stays visible, because Infinite Backlog renders blank in headless browsers. The options:
 
-Development without installing the console script still works:
+- a Chromium-based browser that is your system default or currently open, started with the server's own private profile
+- Playwright's bundled Chromium, also with a private profile
+- an already-open browser with a local debug port (`--remote-debugging-port=9222`, or `IB_CDP_URL`). This uses that browser's real profile and opens one new tab. You opt in to this one.
+- any other Chromium-based browser you point to by path
 
-```bash
-python server.py
-```
+Firefox and Safari can't be driven this way. Pick the bundled Chromium if one of them is your default. The server never reads cookies or profile data from your everyday browser.
 
-The MCP server name is `infinitebacklog`. Logging goes to stderr only, which stdio transport requires.
+**HTTP mode.** No browser. The server signs in through Infinite Backlog's own login form over HTTPS, with the standard authorization code and PKCE flow, then refreshes the token as needed. It identifies itself as `infinitebacklog-mcp`. It solves no captchas. If the login asks for a captcha or 2FA, it stops with `browser_sign_in_required`, and you switch to a browser mode. In HTTP mode, `open_site` and `current_url` don't apply.
 
-## MCP client configuration
+| | Browser mode | HTTP mode |
+| --- | --- | --- |
+| Needs a browser | Yes | No |
+| Sign in by hand | Yes | No |
+| Needs `IB_USERNAME` and `IB_PASSWORD` in `.env` | Optional | Yes |
+| Captcha or 2FA | Yes, by hand in the window | No, the server stops and asks you to switch |
 
-Use the absolute path to this project. Treat API keys and `IB_PASSWORD` as secrets. The process loads `.env` from the project directory and will not override variables you already set.
+Neither mode writes tokens to disk. The password is never logged or returned.
 
-**Installed command (Cursor / Claude Desktop style):**
+## Supported tools
 
-```json
-{
-  "mcpServers": {
-    "infinitebacklog": {
-      "command": "infinitebacklog-mcp",
-      "env": {
-        "OPENAI_API_KEY": "sk-..."
-      }
-    }
-  }
-}
-```
+Games are identified by their slug from `search_games`. You can own a game more than once, one copy per platform. Progress, acquisition, DLC, tags, play records and playthroughs belong to a copy. Ratings and reviews belong to the game. When a game has several copies, pass `collection_id` (shown by `list_collection_game_options`).
 
-**Module path (development):**
+Anything that deletes needs `confirm=true`.
 
-```json
-{
-  "mcpServers": {
-    "infinitebacklog": {
-      "command": "python",
-      "args": ["-m", "infinitebacklog_mcp.server"],
-      "cwd": "/absolute/path/to/infinitebacklog-mcp",
-      "env": {
-        "OPENAI_API_KEY": "sk-...",
-        "IB_USERNAME": "",
-        "IB_PASSWORD": ""
-      }
-    }
-  }
-}
-```
+### Catalog and game info
 
-**Legacy file launch** (still supported):
+| Tool | What it does |
+| --- | --- |
+| `search_games` | Search the catalog. Returns name, slug, year, type. |
+| `get_game` | Summary, platforms, developers, scores, average playtimes, and your status for that game. |
+| `list_related_content` | DLC, expansions, packs and add-ons, editions, bundles, remakes. |
+| `get_game_stats` | Community numbers: owners per status and completion, wishlists, rating distribution. |
+| `list_achievements` | Achievement and trophy sets (Steam, PlayStation, Xbox, GOG, RetroAchievements) with your progress. `include_list=true` lists every achievement. |
 
-```json
-{
-  "mcpServers": {
-    "infinitebacklog": {
-      "command": "python",
-      "args": ["/absolute/path/to/infinitebacklog-mcp/server.py"],
-      "env": {
-        "OPENAI_API_KEY": "sk-...",
-        "IB_USERNAME": "",
-        "IB_PASSWORD": ""
-      }
-    }
-  }
-}
-```
+### Your collection
 
-Public pages work without a session. Collection tools need one of the two sign-in paths above.
+| Tool | What it does |
+| --- | --- |
+| `list_collection` | Your games, filterable by status or title. |
+| `list_collection_game_options` | Everything about your copies of one game. |
+| `add_game_to_collection` | Add a game on a platform, physical or digital, with a starting status. |
+| `add_game_platform_copy` | Add another copy on a different platform. |
+| `set_game_progress` | Status, completion, progress bar (0-100), notes, playtime and playtime type, times finished, completion date. |
+| `set_game_details` | Platform, ownership, digital or physical, region, edition, lent to or borrowed from. |
+| `set_game_acquisition` | How and where you got it, date, price, notes, digital store, and condition for physical copies. |
+| `delete_game_copy` | Remove one copy. |
 
-## Environment variables
+### DLC and add-ons
 
+| Tool | What it does |
+| --- | --- |
+| `list_collection_content_menus` | DLC and packs attached to a copy, and the ones you can still add. |
+| `add_game_content` | Attach DLC, expansions, packs or add-ons by name (or IGDB id). Already-owned items are skipped. |
+| `remove_game_content` | Detach them again. |
 
-| Variable                 | Required                                  | Description                                                                                       |
-| ------------------------ | ----------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `OPENAI_API_KEY`         | For the autonomous tool (one of the four) | OpenAI key for `run_browser_use_task`                                                             |
-| `ANTHROPIC_API_KEY`      | Alternative                               | Anthropic key                                                                                     |
-| `GOOGLE_API_KEY`         | Alternative                               | Google key                                                                                        |
-| `BROWSER_USE_API_KEY`    | Alternative                               | browser-use Cloud key                                                                             |
-| `IB_USERNAME`            | For `.env` sign-in                        | Username or email for the Infinite Backlog login form. Leave blank to sign in through Playwright. |
-| `IB_PASSWORD`            | For `.env` sign-in                        | Password for that form. Leave blank to sign in through Playwright. Treat it as a secret.          |
-| `IB_HEADLESS`            | Optional                                  | Default headless mode when a tool doesn't pass `headless` (`true` / `false`)                      |
-| `IB_VIEWPORT_WIDTH`      | Optional                                  | Playwright viewport width (default `1280`, clamped)                                               |
-| `IB_VIEWPORT_HEIGHT`     | Optional                                  | Playwright viewport height (default `800`, clamped)                                               |
-| `IB_ALLOW_EVAL_JS`       | Optional                                  | Enable the `evaluate_js` debug tool (`true` / `false`, default `false`)                           |
-| `IB_CHROMIUM_NO_SANDBOX` | Optional                                  | Pass `--no-sandbox` to Chromium (default `false`; containers only)                                |
+### Ratings and reviews
 
+| Tool | What it does |
+| --- | --- |
+| `set_game_rating` | Overall 1-10, plus Gameplay, Story, Visual, Audio and Playability. `clear=true` removes it. |
+| `add_game_review` | Write or edit a review. A draft unless `publish=true` (needs 800+ characters and a score). |
+| `delete_game_review` | Delete it. A published review also needs `published=true`. |
 
+### Play records
 
+Play records are your own notes and checklists for a copy, grouped in categories. Five types:
 
-## Security
+- `keyValue`: name and value ("Final boss" / "Beaten")
+- `checkbox`: a checklist, with optional earned dates (good for tracking achievements by hand)
+- `progress`: earned / total, with an optional description
+- `table`: rows of columns
+- `text`: one free-text note
 
-- Unofficial project. Not affiliated with Infinite Backlog.
-- Navigation, in-page API fetches, and `run_browser_use_task` stay on `https://infinitebacklog.net`. Other origins are rejected.
-- `evaluate_js` is off by default. Screenshots can only be written under the OS temp `infinitebacklog-mcp` directory. Chromium `--no-sandbox` is opt-in via `IB_CHROMIUM_NO_SANDBOX`.
-- Generic `fill` refuses password fields. Only `login` types `IB_PASSWORD`, and only into the Infinite Backlog login form.
-- Treat API keys and `IB_PASSWORD` as secrets. Don't commit `.env`.
-- Assistants using these tools should follow [AGENTS.md](AGENTS.md).
+| Tool | What it does |
+| --- | --- |
+| `list_play_records` | All categories and rows, numbered from 1. |
+| `set_play_record_category` | Add, nest, rename or restyle a category. |
+| `set_play_record` | Add a row, or update one by number or name. |
+| `remove_play_record` | Remove a row, or a whole category. |
+| `copy_play_records` | Copy one copy's play records to another copy of the same game. The target must have none yet. |
+| `share_play_records` | Share with another copy of the same game (`share=true`), or stop sharing (`share=false`). |
 
+### Playthroughs and sessions
 
+| Tool | What it does |
+| --- | --- |
+| `list_playthroughs` | Playthroughs of a copy with their sessions. |
+| `set_playthrough` | Create or edit one: name, type, difficulty, notes, playtime. `extra_hours` and `extra_minutes` add time on top. |
+| `remove_playthrough` | Delete a playthrough and its sessions. |
+| `add_play_session` | Log a session: date, time played, status, notes. Pass `session_id` to edit one. |
+| `remove_play_session` | Delete a session. |
+| `get_play_journal` | Your latest sessions across all games. |
 
-## Development
+### Tags and stats
 
-Project layout:
+| Tool | What it does |
+| --- | --- |
+| `list_custom_tags` | Your custom tags. |
+| `set_game_tags` | Add or remove tags on a copy. Creating new tags needs an Infinite Backlog supporter account (otherwise `feature_locked`). |
+| `delete_custom_tag` | Remove a tag from your library. |
+| `get_user_stats` | Collection, activity, achievement and rating stats, plus a yearly or monthly recap. |
 
-```text
-infinitebacklog-mcp/
-├── AGENTS.md              # operating brief for MCP client agents
-├── src/infinitebacklog_mcp/
-│   ├── server.py          # MCPServer, instructions, main()
-│   ├── browser.py         # Playwright lifecycle
-│   ├── login.py           # Keycloak username/password form
-│   ├── config.py          # constants, .env loading
-│   ├── security.py        # origin, cookie, path, and identifier allowlists
-│   ├── matching.py        # name / kind matching
-│   ├── tools/             # deterministic + agent tools
-│   └── ...
-├── tests/
-├── docs/assets/           # README logos
-└── server.py              # compatibility shim
-```
+### Wishlist
 
+| Tool | What it does |
+| --- | --- |
+| `list_wishlist` | Your wishlist, with notes, pre-order and favourite flags. |
+| `add_to_wishlist` | Add a game, or update one already on the list (`notes`, `preorder`). |
+| `remove_from_wishlist` | Remove a game. Needs `confirm=true`. |
 
+### Custom lists
+
+Lists are public once published, so they stay drafts unless you pass `publish=true`. Only your own lists can be changed or deleted.
+
+| Tool | What it does |
+| --- | --- |
+| `list_my_lists` | Your lists: title, published flag, number of games, last update. |
+| `get_list` | One list with its games in order. |
+| `create_list` | New list from comma-separated game slugs. |
+| `update_list` | Change `title`, `description`, `add_games`, `remove_games`, `ranked` or `publish`. |
+| `delete_list` | Delete one of your lists. Needs `confirm=true`. |
+
+### Playtime contributions
+
+Submitted times go to Infinite Backlog's public playtime data. There is no delete. Submitting again replaces your figures.
+
+| Tool | What it does |
+| --- | --- |
+| `list_playtime_contributions` | The playtime figures you have submitted, newest first. |
+| `submit_playtime` | Submit time to beat and time to complete. Needs a copy marked Beaten or Completed, and `confirm=true`. |
+
+### Session
+
+| Tool | What it does |
+| --- | --- |
+| `choose_browser` | List the sign-in options, or record the one you picked (including HTTP mode). |
+| `login` | Sign in with `.env` credentials. Works in browser modes and HTTP mode. |
+| `open_site`, `current_url`, `close_browser` | Browser modes only. Open a page in the server's window, show where it is, close it. |
+
+## Settings
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `IB_USERNAME`, `IB_PASSWORD` | empty | Sign-in for `login` and HTTP mode. Keep them out of git. |
+| `IB_BROWSER` | empty (ask) | Pre-approve a sign-in mode: `bundled`, `default`, `attach` or `http`. |
+| `IB_BROWSER_PATH` | empty | Pre-approve a specific Chromium-based browser by path. |
+| `IB_CDP_URL` | `http://127.0.0.1:9222` | Local debug endpoint for the attach option. Only localhost is accepted. |
+| `IB_HEADLESS` | `false` | Leave it off: the site renders blank headless. Browser modes only. |
+| `IB_VIEWPORT_WIDTH`, `IB_VIEWPORT_HEIGHT` | 1280 x 800 | Window size. Browser modes only. |
+| `IB_CHROMIUM_NO_SANDBOX` | `false` | Containers only. |
+
+## Supported Platforms
+
+Windows only for now. Other systems are untested. The code is written for them, so reports are welcome.
+
+## More
+
+- [docs/api-v2.md](docs/api-v2.md): the endpoints and payloads this server uses. If Infinite Backlog changes its API, start there.
+- [AGENTS.md](AGENTS.md): notes for assistants calling the tools.
+- [CHANGELOG.md](CHANGELOG.md): what changed in each release.
 
 ## License
 

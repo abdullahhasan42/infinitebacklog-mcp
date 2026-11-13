@@ -11,3 +11,6 @@ venv/
 /tmp/
 .playwright/
 .pytest_cache/
+
+# Archived older versions (kept locally, restorable from git tags)
+archive/

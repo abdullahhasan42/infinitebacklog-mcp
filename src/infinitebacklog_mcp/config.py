@@ -3,60 +3,40 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import sys
 from pathlib import Path
-from urllib.parse import quote, urlparse
 
 IB_ORIGIN = "https://infinitebacklog.net"
-WINDOWS_PC_PLATFORM = "Windows PC"
 
-# Catalog search. IB v1.13.6: live filter is /games?q=...  /games?search= does not filter.
-# Fill #game-search. Never fill #platforms-search ("Search for platform").
-CATALOG_QUERY_PARAM = "q"
-GAME_SEARCH_SELECTORS = (
-    "#game-search",
-    'input[placeholder="Search for a game"]',
-    'input[placeholder*="Search for a game" i]',
-)
-RELATED_NAV_SELECTOR = "ul.related-games-nav a"
+# IB v2.1.0 (Nov 2026): Vue 3 + Tailwind rewrite. The SPA talks to a same-origin JSON API
+# under /api with a Keycloak Bearer token. Tools read and write through that API.
+SITE_VERSION = "2.1.0"
+API_PREFIX = "/api"
 
-RELATED_NAV_RE = re.compile(
-    r"(EDITION|REMAKE|DLC|BUNDLE|PACK|ADDON|ADD-ON|EXPANSION|ADDITIONAL|EXTRA|CONTENT|MOD)",
-    re.I,
-)
+# IGDB game categories as used by /api/games/{id}/categories?category[]=N
+GAME_CATEGORIES = {
+    0: "main_game",
+    1: "dlc",
+    2: "expansion",
+    3: "bundle",
+    4: "standalone_expansion",
+    5: "mod",
+    6: "episode",
+    7: "season",
+    8: "remake",
+    9: "remaster",
+    10: "expanded_game",
+    11: "port",
+    12: "fork",
+    13: "pack",
+    14: "update",
+}
+# Additions the collection modal lists under DLC & expansions (completion tracked) ...
+DLC_CATEGORIES = frozenset({1, 2, 4, 6, 7})
+# ... and under packs / add-ons (no completion).
+ADDON_CATEGORIES = frozenset({5, 13, 14})
+EDITION_CATEGORIES = frozenset({3})
 
-
-def is_filter_search_box(element_id: str = "", placeholder: str = "") -> bool:
-    """True for sidebar filter search, not the games catalog box."""
-    eid = (element_id or "").strip().lower()
-    ph = (placeholder or "").strip().lower()
-    if eid == "game-search" or "game" in ph:
-        return False
-    if eid in {"platforms-search", "genres-search"}:
-        return True
-    return "platform" in ph or "genre" in ph or eid.endswith("-search")
-
-
-def is_parent_game_url(url: str, slug: str) -> bool:
-    """True only for /games/{slug}, not sibling slugs such as hades vs hades--1."""
-    path = urlparse(url or "").path.rstrip("/")
-    slug = (slug or "").strip().strip("/")
-    if slug.startswith("games/"):
-        slug = slug.split("/", 1)[1]
-    return bool(slug) and path == f"/games/{slug}"
-
-
-def catalog_search_path(query: str) -> str:
-    """Path that matches live IB catalog search after submit."""
-    q = (query or "").strip()
-    return f"/games?{CATALOG_QUERY_PARAM}={quote(q)}"
-
-
-SKIP_FIELD_RE = re.compile(
-    r"acquisit|source|amount|note|price|cost|borrow|lent|condition|region",
-    re.I,
-)
 
 RATING_SCORE_LABELS = {
     1: "Disaster",
@@ -71,29 +51,6 @@ RATING_SCORE_LABELS = {
     10: "Masterpiece",
 }
 
-RATING_WIDGET_LABELS = {
-    "score": "Overall Rating",
-    "overall": "Overall Rating",
-    "gameplay": "Gameplay",
-    "story": "Story",
-    "sound": "Audio",
-    "audio": "Audio",
-    "visual": "Visual",
-    "accessibility": "Playability",
-    "playability": "Playability",
-}
-
-RATING_API_FIELDS = {
-    "score": "score",
-    "overall": "score",
-    "gameplay": "gameplay",
-    "story": "story",
-    "sound": "sound",
-    "audio": "sound",
-    "visual": "visual",
-    "accessibility": "accessibility",
-    "playability": "accessibility",
-}
 
 STATUS_ALIASES = {
     "nostatus": "noStatus",
@@ -135,6 +92,7 @@ COMPLETION_NAMES = {
 
 ACQUISITION_NAMES = {
     "purchase": "Purchase",
+    "subscription": "Subscription",
     "gift": "Gift",
     "trade": "Trade",
     "keyBundle": "Key Bundle",
@@ -161,6 +119,37 @@ ACQUISITION_ALIASES = {
     "free to play": "freeToPlay",
     "freetoplay": "freeToPlay",
     "free-to-play": "freeToPlay",
+    "subscription": "subscription",
+    "game pass": "subscription",
+}
+
+OWNERSHIP_NAMES = {
+    "owned": "Owned",
+    "household": "Shared (household)",
+    "subscription": "Subscription",
+    "borrowed": "Borrowed",
+    "rented": "Rented",
+    "unlicensed": "Unlicensed",
+    "formerlyOwned": "Formerly owned",
+    "other": "Other",
+    "lentOut": "Lent out",
+}
+OWNERSHIP_ALIASES = {
+    "owned": "owned",
+    "own": "owned",
+    "household": "household",
+    "shared": "household",
+    "family": "household",
+    "subscription": "subscription",
+    "borrowed": "borrowed",
+    "rented": "rented",
+    "unlicensed": "unlicensed",
+    "formerly owned": "formerlyOwned",
+    "formerlyowned": "formerlyOwned",
+    "sold": "formerlyOwned",
+    "other": "other",
+    "lent out": "lentOut",
+    "lentout": "lentOut",
 }
 
 DIGITAL_STORE_NAMES = {
@@ -181,9 +170,19 @@ DIGITAL_STORE_NAMES = {
     "legacyGames": "Legacy Games",
     "stove": "Stove",
     "flashpoint": "Flashpoint",
+    "psn": "PlayStation Store",
+    "nintendoEShop": "Nintendo eShop",
+    "wiiShop": "Wii Shop",
+    "appleAppStore": "Apple App Store",
+    "googlePlayStore": "Google Play",
+    "retroAchievement": "RetroAchievements",
+    "macAppStore": "Mac App Store",
+    "humble": "Humble",
+    "metaStore": "Meta Store",
+    "other": "Other",
 }
 
-PLAY_RECORD_TYPES = ("keyValue", "checkbox", "progress", "table")
+PLAY_RECORD_TYPES = ("keyValue", "checkbox", "progress", "table", "text")
 PLAY_RECORD_TYPE_ALIASES = {
     "keyvalue": "keyValue",
     "key-value": "keyValue",
@@ -193,6 +192,53 @@ PLAY_RECORD_TYPE_ALIASES = {
     "checkbox": "checkbox",
     "progress": "progress",
     "table": "table",
+    "text": "text",
+    "note": "text",
+    "notes": "text",
+    "achievements": "checkbox",
+    "list": "keyValue",
+}
+
+PLAYTHROUGH_TYPES = (
+    "firstPlaythrough",
+    "replay",
+    "speedrun",
+    "coop",
+    "competitive",
+    "continuous",
+    "streaming",
+    "achievements",
+    "challengeRun",
+)
+PLAYTHROUGH_TYPE_ALIASES = {
+    "first": "firstPlaythrough",
+    "first playthrough": "firstPlaythrough",
+    "firstplaythrough": "firstPlaythrough",
+    "replay": "replay",
+    "speedrun": "speedrun",
+    "coop": "coop",
+    "co-op": "coop",
+    "competitive": "competitive",
+    "continuous": "continuous",
+    "streaming": "streaming",
+    "achievements": "achievements",
+    "achievement hunt": "achievements",
+    "challenge": "challengeRun",
+    "challenge run": "challengeRun",
+    "challengerun": "challengeRun",
+}
+PLAYTHROUGH_PLAYTIME_TYPES = ("session", "playthrough")
+SESSION_STATUSES = ("start", "playing", "campaignCompleted", "completed", "shelved", "dropped")
+SESSION_STATUS_ALIASES = {
+    "start": "start",
+    "started": "start",
+    "playing": "playing",
+    "beaten": "campaignCompleted",
+    "campaigncompleted": "campaignCompleted",
+    "completed": "completed",
+    "shelved": "shelved",
+    "paused": "shelved",
+    "dropped": "dropped",
 }
 
 REVIEW_MIN_PUBLISH_CHARS = 800
@@ -213,6 +259,11 @@ def env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def default_headless() -> bool:
+    """IB v2 renders a blank page in headless Chromium, so the window is visible by default."""
+    return env_bool("IB_HEADLESS", False)
 
 
 def viewport() -> dict[str, int]:
@@ -276,8 +327,9 @@ def load_project_env(root: Path | None = None) -> None:
         os.environ[key] = value
 
 
-def playwright_profile_dir() -> Path:
-    path = project_root() / ".playwright" / "ib-profile"
+def playwright_profile_dir(name: str = "ib-profile") -> Path:
+    """This server's private browser profile. Never the user's everyday profile."""
+    path = project_root() / ".playwright" / name
     path.mkdir(parents=True, exist_ok=True)
     return path
 

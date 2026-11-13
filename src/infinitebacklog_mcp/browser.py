@@ -1,41 +1,25 @@
-"""Shared Playwright browser lifecycle for deterministic tools."""
+"""Browser lifecycle for the tools.
+
+No browser is opened or attached until the user has picked one (MCP elicitation, the
+choose_browser tool, or an IB_BROWSER / IB_BROWSER_PATH pre-approval). Launched browsers
+always use this server's own profile under .playwright/; an attached browser gets one new
+tab and nothing else is read. Paths are never reported, only executable file names.
+"""
 from __future__ import annotations
 
-import atexit
 import asyncio
+import atexit
+import contextvars
 import functools
+import inspect
 import os
-import re
-import urllib.request
-from typing import Optional
+from typing import Any, Literal, Optional
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
-from .cdp_bridge import CdpOriginBridge
-from .cdp_attach import (
-    discover_endpoint_urls,
-    fetch_debug_json,
-    local_devtools_port_files,
-    pick_ib_target,
-    public_endpoint,
-    same_ib_page,
-    websocket_url_from_version,
-)
-from .config import (
-    IB_ORIGIN,
-    env_bool,
-    load_project_env,
-    logger,
-    playwright_profile_dir,
-    viewport,
-)
-from .security import (
-    SecurityError,
-    chromium_launch_args,
-    clamp_wait_ms,
-    ib_url_from_path,
-    is_ib_origin,
-)
+from .browsers import Candidate, candidates, custom_candidate, profile_name
+from .config import IB_ORIGIN, default_headless, load_project_env, logger, playwright_profile_dir, viewport
+from .security import SecurityError, chromium_launch_args, clamp_wait_ms, ib_url_from_path, is_ib_origin
 
 _browser: Optional[Browser] = None
 _context: Optional[BrowserContext] = None
@@ -44,32 +28,77 @@ _playwright = None
 _headless_mode: Optional[bool] = None
 _attached: bool = False
 _opened_page: bool = False
-_attach_source: str = ""
-_cdp_bridge: CdpOriginBridge | None = None
-_tool_lock = asyncio.Lock()
-_CDP_CONNECT_TIMEOUT_S = 20.0
 _login_result: str = ""
-_iframe_body: bytes | None = None
-_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/120.0.0.0 Safari/537.36"
-)
+_tool_lock = asyncio.Lock()
+
+_choice: Optional[Candidate] = None
+_offered: dict[str, Candidate] = {}
+_request_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar("ib_request_ctx", default=None)
+
+_SLUG_ARGS = ("slug", "parent_slug", "game_slug")
+
+
+class BrowserChoiceRequired(SecurityError):
+    """Raised before any browser opens when the user has not picked one yet."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        super().__init__("browser_choice_required", str(payload.get("hint") or ""))
+        self.payload = payload
+
+
+# --- tool wrapper ----------------------------------------------------------
+
+
+def _validate_slugs(fn, args, kwargs) -> None:
+    """Reject a bad slug before the browser starts. Empty slugs are left to the tool."""
+    from .pages import clean_slug
+
+    try:
+        bound = inspect.signature(fn).bind_partial(*args, **kwargs)
+    except TypeError:
+        return
+    for name in _SLUG_ARGS:
+        value = bound.arguments.get(name)
+        if isinstance(value, str) and value.strip():
+            clean_slug(value)
 
 
 def locked_tool(fn):
-    """Serialize tool bodies and convert SecurityError into a JSON error payload."""
+    """Serialize tool bodies, validate slugs early, accept the MCP Context, return JSON errors."""
+    from mcp.server.mcpserver import Context
+
     from .normalize import _dumps
 
     @functools.wraps(fn)
-    async def wrapper(*args, **kwargs):
-        async with _tool_lock:
-            try:
-                return await fn(*args, **kwargs)
-            except SecurityError as exc:
-                return _dumps({"error": exc.code, "hint": str(exc)})
+    async def wrapper(*args, ctx: Optional[Context] = None, **kwargs):
+        try:
+            _validate_slugs(fn, args, kwargs)
+        except SecurityError as exc:
+            return _dumps({"error": exc.code, "hint": str(exc)})
+        token = _request_ctx.set(ctx)
+        try:
+            async with _tool_lock:
+                try:
+                    return await fn(*args, **kwargs)
+                except BrowserChoiceRequired as exc:
+                    return _dumps(exc.payload)
+                except SecurityError as exc:
+                    return _dumps({"error": exc.code, "hint": str(exc)})
+                except ValueError as exc:
+                    return _dumps({"error": "invalid_argument", "hint": str(exc)})
+        finally:
+            _request_ctx.reset(token)
 
+    sig = inspect.signature(fn)
+    params = list(sig.parameters.values()) + [
+        inspect.Parameter("ctx", inspect.Parameter.KEYWORD_ONLY, default=None, annotation=Optional[Context])
+    ]
+    wrapper.__signature__ = sig.replace(parameters=params)
+    wrapper.__annotations__ = {**getattr(fn, "__annotations__", {}), "ctx": Optional[Context]}
     return wrapper
+
+
+# --- origin guards ---------------------------------------------------------
 
 
 async def recover_off_origin(page: Page) -> None:
@@ -81,345 +110,212 @@ async def recover_off_origin(page: Page) -> None:
     except Exception:
         pass
     if is_ib_origin(page.url):
-        raise SecurityError(
-            "off_origin",
-            "Navigation left infinitebacklog.net; returned to the previous page.",
-        )
+        raise SecurityError("off_origin", "Navigation left infinitebacklog.net; returned to the previous page.")
     try:
         await page.goto(f"{IB_ORIGIN}/", wait_until="domcontentloaded", timeout=60000)
     except Exception:
         pass
     if is_ib_origin(page.url):
-        raise SecurityError(
-            "off_origin",
-            "Navigation left infinitebacklog.net; returned to the home page.",
-        )
+        raise SecurityError("off_origin", "Navigation left infinitebacklog.net; returned to the home page.")
     raise SecurityError("off_origin", "Navigation left infinitebacklog.net.")
 
 
 async def require_ib_page(page: Page) -> None:
     if not is_ib_origin(page.url):
-        raise SecurityError(
-            "off_origin",
-            "Current page is not infinitebacklog.net. Call open_site first.",
-        )
+        raise SecurityError("off_origin", "Current page is not infinitebacklog.net. Call open_site first.")
 
 
-def session_mode() -> str:
-    return "attached" if _attached else "launched"
+# --- choosing a browser ----------------------------------------------------
+
+
+def chosen_browser() -> Optional[dict[str, str]]:
+    return _choice.public() if _choice else None
+
+
+def is_http_mode() -> bool:
+    return bool(_choice and _choice.kind == "http")
 
 
 def session_details() -> str:
-    """Status lines for open_site and current_url. No cookies, no websocket URL."""
-    lines = [f"mode={session_mode()}"]
-    if _attached:
-        if _attach_source:
-            lines.append(f"browser={_attach_source}")
-    else:
+    """Status lines for open_site and current_url. No paths, cookies or endpoints."""
+    if is_http_mode():
+        return "mode=http (no browser)"
+    lines = [f"mode={'attached' if _attached else 'launched'}"]
+    if _choice:
+        lines.append(f"browser={_choice.label}")
+    if not _attached:
         lines.append(f"headless={_headless_mode}")
     return "\n".join(lines)
 
 
+async def list_choices() -> list[Candidate]:
+    global _offered
+    found = await asyncio.to_thread(candidates)
+    _offered = {c.id: c for c in found}
+    return found
+
+
+def _choice_payload(found: list[Candidate]) -> dict[str, Any]:
+    return {
+        "error": "browser_choice_required",
+        "hint": (
+            "No browser has been opened. Ask the user which one to use, then call "
+            "choose_browser with their answer. Do not pick for them."
+        ),
+        "choices": [c.public() for c in found]
+        + [{"id": "other", "kind": "launch", "label": "Another Chromium-based browser (pass its path)"}],
+    }
+
+
+def set_choice(choice: str, path: str = "") -> Candidate:
+    """Record the user's pick. Raises ValueError for an unknown id or a bad path."""
+    global _choice
+    key = (choice or "").strip()
+    if key == "other":
+        picked = custom_candidate(path)
+    elif key in _offered:
+        picked = _offered[key]
+    else:
+        raise ValueError(f"Unknown browser choice {key!r}. Call choose_browser without a choice to list them.")
+    _choice = picked
+    return picked
+
+
+def _pre_approved(found: list[Candidate]) -> Optional[Candidate]:
+    """IB_BROWSER / IB_BROWSER_PATH let a user approve a browser ahead of time."""
+    path = (os.environ.get("IB_BROWSER_PATH") or "").strip()
+    if path:
+        return custom_candidate(path)
+    wanted = (os.environ.get("IB_BROWSER") or "").strip().lower()
+    if not wanted:
+        return None
+    for cand in found:
+        if wanted == "bundled" and cand.kind == "bundled":
+            return cand
+        if wanted == "attach" and cand.kind == "attach":
+            return cand
+        if wanted == "http" and cand.kind == "http":
+            return cand
+        if wanted == "default" and cand.kind == "launch" and "default browser" in cand.label:
+            return cand
+    raise SecurityError("browser_unavailable", f"IB_BROWSER={wanted} is not available on this machine.")
+
+
+async def _ask_user(found: list[Candidate]) -> Optional[Candidate]:
+    """Ask through MCP elicitation. None when the client can't ask."""
+    ctx = _request_ctx.get()
+    if ctx is None:
+        return None
+    from pydantic import Field, create_model
+
+    ids = tuple([c.id for c in found] + ["other"])
+    lines = "\n".join(f"- {c.id}: {c.label}" for c in found)
+    schema = create_model(
+        "BrowserChoice",
+        choice=(Literal[ids], Field(description="Which browser to use")),  # type: ignore[valid-type]
+        path=(str, Field(default="", description="Only for 'other': the browser executable path")),
+    )
+    message = (
+        "Infinite Backlog MCP needs a browser to sign in and work on your account. Pick one:\n"
+        f"{lines}\n- other: another Chromium-based browser (enter its path)"
+    )
+    try:
+        result = await ctx.elicit(message=message, schema=schema)
+    except Exception:
+        return None
+    if getattr(result, "action", "") != "accept":
+        raise SecurityError("browser_not_approved", "No browser was approved, so nothing was opened.")
+    data = result.data
+    return set_choice(str(data.choice), str(getattr(data, "path", "") or ""))
+
+
+async def _resolve_choice() -> Candidate:
+    global _choice
+    if _choice:
+        return _choice
+    found = await list_choices()
+    pre = _pre_approved(found)
+    if pre:
+        _choice = pre
+        return pre
+    asked = await _ask_user(found)
+    if asked:
+        return asked
+    raise BrowserChoiceRequired(_choice_payload(found))
+
+
+# --- lifecycle -------------------------------------------------------------
+
+
 def _reset_session_state() -> None:
-    global _browser, _context, _page, _playwright, _headless_mode
-    global _attached, _opened_page, _attach_source, _cdp_bridge, _login_result
+    global _browser, _context, _page, _playwright, _headless_mode, _attached, _opened_page, _login_result
     _page = _context = _browser = _playwright = None
     _headless_mode = None
     _attached = False
     _opened_page = False
-    _attach_source = ""
-    _cdp_bridge = None
     _login_result = ""
+    from .api import forget_session
+
+    forget_session()
 
 
-async def _stop_playwright(playwright) -> None:
-    if playwright is None:
-        return
-    try:
-        await asyncio.wait_for(playwright.stop(), timeout=3)
-    except Exception:
-        logger.info("Playwright stop did not finish; leaving the driver")
-
-
-async def _connect_cdp(playwright, endpoint: str):
-    """Connect, or return None. A timeout discards the driver so the next call is fresh."""
-    global _playwright
-    try:
-        return await asyncio.wait_for(
-            playwright.chromium.connect_over_cdp(endpoint),
-            timeout=_CDP_CONNECT_TIMEOUT_S,
-        )
-    except asyncio.TimeoutError:
-        logger.info("CDP connect timed out for %s", public_endpoint(endpoint))
-        await _stop_playwright(playwright)
-        _playwright = None
-        return None
-    except Exception as exc:
-        detail = re.sub(r"/devtools/browser/[A-Za-z0-9._-]+", "/devtools/browser/...", str(exc))
-        logger.info("CDP connect failed for %s: %s", public_endpoint(endpoint), detail[:240])
-        return None
-
-
-async def _ib_pages(browser: Browser) -> list[tuple[BrowserContext, Page]]:
-    found: list[tuple[BrowserContext, Page]] = []
-    for context in list(browser.contexts):
-        for page in list(context.pages):
-            try:
-                url = page.url
-            except Exception:
-                continue
-            if is_ib_origin(url):
-                found.append((context, page))
-    return found
-
-
-async def _wait_for_ib_pages(browser: Browser) -> list[tuple[BrowserContext, Page]]:
-    found = await _ib_pages(browser)
-    if found:
-        return found
-    for _ in range(20):
-        await asyncio.sleep(0.1)
-        found = await _ib_pages(browser)
-        if found:
-            return found
-    return []
-
-
-def _prefer_page(
-    pages: list[tuple[BrowserContext, Page]],
-    chosen_url: str = "",
-) -> tuple[BrowserContext, Page]:
-    if chosen_url:
-        for context, page in pages:
-            if same_ib_page(page.url, chosen_url):
-                return context, page
-    for context, page in pages:
-        path = urlparse_path(page.url)
-        if path.startswith("/users/"):
-            return context, page
-    return pages[0]
-
-
-def urlparse_path(url: str) -> str:
-    from urllib.parse import urlparse
-
-    return urlparse(url or "").path or ""
-
-
-async def _open_background_page(
-    browser: Browser,
-) -> tuple[BrowserContext, Page] | None:
-    """Open one about:blank tab in the attached browser without focusing it."""
-    before = {id(page) for context in browser.contexts for page in context.pages}
-    try:
-        session = await browser.new_browser_cdp_session()
-    except Exception:
-        logger.info("Could not open a browser CDP session for a background tab")
-        return None
-    try:
-        await session.send(
-            "Target.createTarget",
-            {"url": "about:blank", "background": True},
-        )
-    except Exception:
-        logger.info("Background tab create failed")
-        return None
-    finally:
-        try:
-            await session.detach()
-        except Exception:
-            pass
-    for _ in range(30):
-        for context in list(browser.contexts):
-            for page in list(context.pages):
-                if id(page) not in before:
-                    return context, page
-        await asyncio.sleep(0.1)
-    logger.info("Background tab did not appear in Playwright")
-    return None
-
-
-async def _bind_attached_page(
-    browser: Browser,
-    chosen_url: str,
-) -> tuple[BrowserContext, Page, bool] | None:
-    pages = await _wait_for_ib_pages(browser)
-    if chosen_url:
-        if not pages:
-            logger.info("CDP listed an Infinite Backlog tab that Playwright did not expose")
-            return None
-        context, page = _prefer_page(pages, chosen_url)
-        return context, page, False
-    if pages:
-        context, page = _prefer_page(pages, "")
-        return context, page, False
-    opened = await _open_background_page(browser)
-    if opened is None:
-        return None
-    context, page = opened
-    return context, page, True
-
-
-async def _disconnect_browser(browser: Browser | None) -> None:
-    """Drop a CDP connection. Does not close the user's context or tabs."""
-    if browser is None:
-        return
-    try:
-        await browser.close()
-    except Exception:
-        logger.info("CDP disconnect failed")
-
-
-async def _probe_cdp_endpoints() -> list[tuple[str, str, str | None, str, bool]]:
-    """Return (source, http_url, ws_url, chosen_page_url, list_known).
-
-    Endpoints that already have an Infinite Backlog tab come first.
-    list_known is false when /json/list is missing, which happens on some
-    inspect-toggle debug ports. Those still connect via the port-file websocket.
-    """
-    env_url = os.environ.get("IB_CDP_URL", "")
-    endpoints = discover_endpoint_urls(
-        env_url=env_url,
-        port_files=local_devtools_port_files(),
-        include_probe=not (env_url or "").strip(),
-    )
-    ready: list[tuple[str, str, str | None, str, bool]] = []
-    plain: list[tuple[str, str, str | None, str, bool]] = []
-    for source, http_url, file_ws in endpoints:
-        version = await asyncio.to_thread(fetch_debug_json, http_url, "version")
-        ws_url = websocket_url_from_version(version) or file_ws
-        if not isinstance(version, dict) and not ws_url:
-            continue
-        targets = await asyncio.to_thread(fetch_debug_json, http_url, "list")
-        list_known = isinstance(targets, list)
-        chosen = pick_ib_target(targets) if list_known else None
-        row = (source, http_url, ws_url, str((chosen or {}).get("url") or ""), list_known)
-        if chosen:
-            ready.append(row)
-        else:
-            plain.append(row)
-    ready.sort(key=lambda row: (0 if urlparse_path(row[3]).startswith("/users/") else 1, 0))
-    return ready + plain
-
-
-async def _attach_user_browser() -> bool:
-    """Attach to an existing local browser. Never launches one."""
-    global _browser, _context, _page, _playwright
-    global _attached, _opened_page, _attach_source, _headless_mode, _cdp_bridge
-    if not env_bool("IB_CDP", True):
-        return False
-    probed = await _probe_cdp_endpoints()
-    if not probed:
-        logger.info("No local browser debug port is listening")
-        return False
-    for source, http_url, ws_url, chosen_url, list_known in probed:
-        if _playwright is None:
-            _playwright = await async_playwright().start()
-        version = await asyncio.to_thread(fetch_debug_json, http_url, "version")
-        bridge: CdpOriginBridge | None = None
-        if isinstance(version, dict):
-            browser = await _connect_cdp(_playwright, http_url)
-        else:
-            browser = None
-        if browser is None and ws_url:
-            if _playwright is None:
-                _playwright = await async_playwright().start()
-            try:
-                bridge = CdpOriginBridge(ws_url)
-                await bridge.start()
-                browser = await _connect_cdp(_playwright, bridge.http_url)
-            except Exception:
-                logger.info("CDP bridge failed source=%s", source)
-                browser = None
-            if browser is None and bridge is not None:
-                await bridge.stop()
-                bridge = None
-        if browser is None:
-            continue
-        # An unknown target list must not be treated as "no IB tab".
-        bound = await _bind_attached_page(browser, chosen_url if list_known else "")
-        if bound is None:
-            await _disconnect_browser(browser)
-            if bridge is not None:
-                await bridge.stop()
-            continue
-        context, page, opened = bound
-        _browser = browser
-        _context = context
-        _page = page
-        _attached = True
-        _opened_page = opened
-        _attach_source = source
-        _cdp_bridge = bridge
-        _headless_mode = False
-        logger.info("Attached to existing browser source=%s", source)
-        return True
-    return False
-
-
-def _login_status_iframe_body() -> bytes:
-    """The Keycloak session iframe stalls in Chromium. Serve a finished copy instead."""
-    global _iframe_body
-    if _iframe_body is not None:
-        return _iframe_body
-    url = (
-        "https://infinitebacklog.net/auth/realms/ib/"
-        "protocol/openid-connect/login-status-iframe.html"
-    )
-    try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            _iframe_body = resp.read()
-    except Exception:
-        logger.info("Login status frame was not fetched; using an empty document")
-        _iframe_body = b"<!doctype html><html><body></body></html>"
-    return _iframe_body
-
-
-async def _route_login_iframe(context: BrowserContext) -> None:
-    async def handle(route) -> None:
-        body = await asyncio.to_thread(_login_status_iframe_body)
-        await route.fulfill(
-            status=200,
-            headers={"content-type": "text/html; charset=utf-8"},
-            body=body,
-        )
-
-    await context.route("**/login-status-iframe.html", handle)
-
-
-async def _launch_playwright(headless: bool) -> Page:
-    """Open this server's Chromium profile. Does not attach to another browser."""
-    global _browser, _context, _page, _playwright, _headless_mode
-    global _attached, _opened_page, _attach_source
+async def _launch(cand: Candidate, headless: bool) -> Page:
+    global _browser, _context, _page, _playwright, _headless_mode, _attached, _opened_page
     if _playwright is None:
         _playwright = await async_playwright().start()
+    options: dict[str, Any] = {
+        "user_data_dir": str(playwright_profile_dir(profile_name(cand))),
+        "headless": headless,
+        "viewport": viewport(),
+        "args": chromium_launch_args(),
+    }
+    if cand.kind == "launch" and cand.exe:
+        options["executable_path"] = cand.exe
     try:
-        _context = await _playwright.chromium.launch_persistent_context(
-            user_data_dir=str(playwright_profile_dir()),
-            headless=headless,
-            viewport=viewport(),
-            user_agent=_USER_AGENT,
-            args=chromium_launch_args(),
-        )
+        _context = await _playwright.chromium.launch_persistent_context(**options)
     except Exception as exc:
         raise SecurityError(
             "browser_start_failed",
-            "Playwright did not start. Close a leftover Playwright window from this server and try again.",
+            "The chosen browser did not start. Close a leftover window from this server, "
+            "or call choose_browser to pick another one.",
         ) from exc
-    await _route_login_iframe(_context)
     _browser = _context.browser
     _headless_mode = headless
     _attached = False
     _opened_page = True
-    _attach_source = ""
-    pages = [item for item in _context.pages if not item.is_closed()]
+    pages = [p for p in _context.pages if not p.is_closed()]
     _page = pages[0] if pages else await _context.new_page()
-    if _page.url and "infinitebacklog.net" in _page.url:
-        try:
-            await _page.reload(wait_until="domcontentloaded", timeout=60000)
-        except Exception:
-            logger.info("Playwright page did not reload")
-    logger.info("Playwright Chromium started headless=%s", headless)
+    logger.info("Browser started: %s, headless=%s", cand.label.split(" ")[0], headless)
+    return _page
+
+
+async def _attach(cand: Candidate) -> Page:
+    global _browser, _context, _page, _playwright, _headless_mode, _attached, _opened_page
+    if _playwright is None:
+        _playwright = await async_playwright().start()
+    try:
+        _browser = await asyncio.wait_for(_playwright.chromium.connect_over_cdp(cand.endpoint), timeout=20)
+    except Exception as exc:
+        raise SecurityError(
+            "browser_attach_failed",
+            "Could not attach to the open browser. Call choose_browser to pick another option.",
+        ) from exc
+    _context = _browser.contexts[0] if _browser.contexts else await _browser.new_context()
+    _page = await _context.new_page()
+    _attached = True
+    _opened_page = True
+    _headless_mode = False
+    logger.info("Attached to an open browser (one new tab)")
+    return _page
+
+
+async def _http_session():
+    """Browserless mode: one in-memory HTTP session; signs in from .env when both values are set."""
+    global _page
+    from .http_auth import HttpSession
+
+    _page = HttpSession()
+    await _maybe_login(_page)
     return _page
 
 
@@ -440,77 +336,70 @@ async def _maybe_login(page: Page) -> None:
 
 
 async def _ensure_browser(headless: bool | None = None) -> Page:
-    global _browser, _context, _page, _playwright, _headless_mode
-    global _attached, _opened_page, _attach_source
+    """The page every tool works in. Opens nothing until the user has chosen a browser."""
     load_project_env()
     if headless is None:
-        headless = env_bool("IB_HEADLESS", True)
-    if _attached:
-        await _close_browser()
+        headless = default_headless()
     if _page is not None and not _page.is_closed():
-        if headless is False and _headless_mode is True:
+        if not _attached and headless is False and _headless_mode is True:
             await _close_browser()
         else:
+            from .api import attach_token_listener
+
+            attach_token_listener(_page)
             await _maybe_login(_page)
             return _page
-    if (
-        _browser is not None
-        and _headless_mode is not None
-        and _headless_mode != headless
-    ):
-        await _close_browser()
-    if _context is None or _browser is None or not _browser.is_connected():
-        await _launch_playwright(headless)
-    if _page is None or _page.is_closed():
-        assert _context is not None
-        pages = [item for item in _context.pages if not item.is_closed()]
-        _page = pages[0] if pages else await _context.new_page()
-        _opened_page = True
-    await _maybe_login(_page)
-    return _page
+    cand = await _resolve_choice()
+    if cand.kind == "http":
+        return await _http_session()
+    page = await (_attach(cand) if cand.kind == "attach" else _launch(cand, headless))
+    from .api import attach_token_listener
+
+    attach_token_listener(page)
+    await _maybe_login(page)
+    return page
 
 
 async def _close_browser() -> None:
-    had_session = _browser is not None or _playwright is not None
-    attached = _attached
-    opened = _opened_page
-    page = _page
-    context = _context
-    browser = _browser
-    playwright = _playwright
-    bridge = _cdp_bridge
-    if attached:
-        if opened and page is not None:
-            try:
-                if not page.is_closed():
-                    await page.close()
-            except Exception:
-                logger.info("Could not close the tab this server opened")
-        await _disconnect_browser(browser)
-        if bridge is not None:
-            await bridge.stop()
-        await _stop_playwright(playwright)
+    """Close what this server opened. An attached browser keeps running; only our tab closes."""
+    had_session = _browser is not None or _playwright is not None or getattr(_page, "is_http", False)
+    page, context, browser, playwright, attached = _page, _context, _browser, _playwright, _attached
+    if getattr(page, "is_http", False):
+        page.forget()
         _reset_session_state()
-        if had_session:
-            logger.info("Disconnected from attached browser")
+        logger.info("HTTP session closed")
         return
-    if page is not None and not page.is_closed():
-        await page.close()
-    if context is not None:
-        await context.close()
+    try:
+        if page is not None and not page.is_closed():
+            await page.close()
+    except Exception:
+        logger.info("Could not close this server's tab")
+    if not attached and context is not None:
+        try:
+            await context.close()
+        except Exception:
+            pass
     if browser is not None:
-        await browser.close()
+        try:
+            await browser.close()
+        except Exception:
+            pass
     if playwright is not None:
-        await playwright.stop()
+        try:
+            await asyncio.wait_for(playwright.stop(), timeout=3)
+        except Exception:
+            pass
     _reset_session_state()
     if had_session:
-        logger.info("Playwright browser closed")
+        logger.info("Browser session closed")
+
+
+# --- navigation helpers ----------------------------------------------------
 
 
 async def _goto_ib(page: Page, path: str, wait_ms: int = 2000) -> None:
     wait_ms = clamp_wait_ms(wait_ms)
-    url = ib_url_from_path(path)
-    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    await page.goto(ib_url_from_path(path), wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_timeout(wait_ms)
     try:
         await page.wait_for_selector("#app", timeout=min(max(wait_ms, 2000), 12000))
@@ -521,7 +410,7 @@ async def _goto_ib(page: Page, path: str, wait_ms: int = 2000) -> None:
 
 
 async def _wait_spa_text(page: Page, min_chars: int = 400, timeout_ms: int = 8000) -> None:
-    """Wait until the Vue app has real content. ~281 chars is the chrome shell without h1."""
+    """Wait until the Vue app has real content (an h1, the search box, or enough text)."""
     try:
         await page.wait_for_function(
             """(min) => {
@@ -529,8 +418,7 @@ async def _wait_spa_text(page: Page, min_chars: int = 400, timeout_ms: int = 800
               if (t.length > min) return true;
               const h1 = document.querySelector('h1');
               if (h1 && (h1.innerText || '').trim()) return true;
-              if (document.querySelector('#game-search')) return true;
-              return false;
+              return !!document.querySelector('#search, #game-search');
             }""",
             arg=int(min_chars),
             timeout=timeout_ms,

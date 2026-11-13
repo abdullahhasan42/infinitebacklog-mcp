@@ -1,136 +1,169 @@
-"""MCP tools: reviews."""
+"""MCP tools: write, publish, and delete your review of a game."""
 from __future__ import annotations
 
-from ..browser import _ensure_browser, _goto_ib, locked_tool
+from typing import Any
+
+from ..api import api_error, ib_api
+from ..browser import _ensure_browser, locked_tool
 from ..config import REVIEW_MIN_PUBLISH_CHARS
-from ..js import CALL_REVIEW_SAVE_JS, CLICK_EXACT_BUTTON_JS, CLICK_NAMED_BUTTON_JS, FILL_REVIEW_FORM_JS
-from ..normalize import _dumps, _reviews_list, profile_scope
-from ..pages import _fetch_ib_api, _resolve_game_context, _wait_review_form
-from ..security import sanitize_path_segment
+from ..normalize import (
+    _dumps,
+    html_text_length,
+    normalize_acquisition,
+    normalize_completion,
+    parse_score,
+    slim_game,
+    text_to_html,
+)
+from ..pages import game_context
+from ..security import sanitize_username
+
+_KEEP = (
+    "title",
+    "content",
+    "pros",
+    "cons",
+    "language",
+    "acquisition",
+    "completion",
+    "playtime",
+    "score",
+    "mature_content",
+    "spoilers",
+    "published",
+    "visual",
+    "story",
+    "gameplay",
+    "sound",
+    "accessibility",
+)
+
+
+def _list(value: str) -> list[str]:
+    import json
+
+    raw = (value or "").strip()
+    if not raw:
+        return []
+    if raw.startswith("["):
+        parsed = json.loads(raw)
+        return [str(x).strip() for x in parsed if str(x).strip()]
+    return [line.strip(" -*\t") for line in raw.splitlines() if line.strip(" -*\t")]
+
+
+async def _my_review(page, user: dict[str, Any], slug: str) -> dict[str, Any] | None:
+    result = await ib_api(page, "GET", f"/users/{sanitize_username(user['username']).lower()}/reviews/{slug}")
+    data = result.get("data")
+    return data if result.get("ok") and isinstance(data, dict) and data.get("id") else None
+
 
 async def add_game_review(
     slug: str,
     body: str,
-    spoilers: bool = False,
-    publish: bool = True,
+    publish: bool = False,
     title: str = "",
-    mature: bool = False,
+    score: str = "",
+    pros: str = "",
+    cons: str = "",
+    spoilers: bool = False,
+    mature_content: bool = False,
+    completion: str = "",
+    acquisition: str = "",
     language: str = "",
-    platform: str = "",
-    feed: bool = False,
-    wait_ms: int = 3000,
+    collection_id: str = "",
+    wait_ms: int = 0,
 ) -> str:
-    """Add or update a review at /games/{slug}/add-review. Body required. Publish needs 800+ characters; use publish=false for Save draft. If a review already exists, opens the existing editor. Never clicks DELETE. Requires login."""
-    if not (body or "").strip():
-        return _dumps({"error": "empty_body"})
-    if publish and len(body.strip()) < REVIEW_MIN_PUBLISH_CHARS:
-        return _dumps(
-            {
-                "error": "too_short_to_publish",
-                "length": len(body.strip()),
-                "min": REVIEW_MIN_PUBLISH_CHARS,
-                "hint": "Pass publish=false to save a draft, or write at least 800 characters.",
-            }
-        )
-
+    """Write or update your review. Saved as a draft unless publish=true. Publishing needs 800+ characters of text and an overall score (1-10). body is plain text (blank lines split paragraphs) or HTML. title 5-100 chars. pros/cons: JSON array or one per line. Re-running edits the same review."""
+    del wait_ms
     page = await _ensure_browser()
-    ctx = await _resolve_game_context(page, slug, "", wait_ms)
-    if not ctx.get("game_id"):
-        return _dumps({"error": "game_not_found", "slug": ctx.get("slug")})
-
-    published = await _fetch_ib_api(
-        page,
-        f"/reviews?user_id={ctx['user_id']}&game_id={ctx['game_id']}&published=true",
-    )
-    drafts = await _fetch_ib_api(
-        page,
-        f"/reviews?user_id={ctx['user_id']}&game_id={ctx['game_id']}&published=false",
-    )
-    existing = _reviews_list(published.get("data")) + _reviews_list(drafts.get("data") if drafts.get("ok") else None)
-    review_path = f"/games/{ctx['slug']}/add-review"
-    if existing:
-        slug_or_id = existing[0].get("slug") or ctx["slug"]
-        review_path = f"/users/{ctx['username']}/reviews/{sanitize_path_segment(str(slug_or_id), name='review slug')}"
-
-    await _goto_ib(page, review_path, wait_ms)
-    if not await _wait_review_form(page, wait_ms):
-        await _goto_ib(page, f"/games/{ctx['slug']}/add-review", wait_ms)
-        if not await _wait_review_form(page, wait_ms):
-            return _dumps({"error": "review_form_not_ready", "url": page.url})
-
-    fill = await page.evaluate(
-        FILL_REVIEW_FORM_JS,
+    ctx = await game_context(page, slug, collection_id, need_row=False)
+    if ctx.get("error"):
+        return _dumps(ctx)
+    me, game = ctx["user"], ctx["game"]
+    rows = ctx["rows"]
+    row = rows[0] if rows else None
+    if collection_id:
+        row = next((r for r in rows if str(r.get("id")) == str(collection_id).strip()), row)
+    existing = await _my_review(page, me, ctx["slug"])
+    content = text_to_html(body)
+    text_len = html_text_length(content)
+    title = (title or "").strip()
+    if title and not (5 <= len(title) <= 100):
+        return _dumps({"error": "invalid_title", "hint": "Title must be 5 to 100 characters."})
+    review_score = parse_score(score) if str(score).strip() else (existing or {}).get("score")
+    if publish and text_len < REVIEW_MIN_PUBLISH_CHARS:
+        return _dumps({"error": "too_short_to_publish", "chars": text_len, "min": REVIEW_MIN_PUBLISH_CHARS})
+    if publish and not review_score:
+        return _dumps({"error": "score_required_to_publish", "hint": "Pass score=1..10 to publish."})
+    payload: dict[str, Any] = {k: (existing or {}).get(k) for k in _KEEP}
+    payload.update(
         {
-            "body": body,
-            "title": title,
-            "spoilers": spoilers,
-            "mature": mature,
-            "feed": feed,
-            "language": language,
-            "platform": platform,
-            "completion": None,
-        },
+            "game_id": ctx["game_id"],
+            "edition_id": (row or {}).get("edition_id"),
+            "platform_id": (row or {}).get("platform_id") or ((game.get("platforms") or [None])[0]),
+            "title": title or (existing or {}).get("title") or None,
+            "content": content,
+            "pros": _list(pros) if pros else (existing or {}).get("pros") or [],
+            "cons": _list(cons) if cons else (existing or {}).get("cons") or [],
+            "language": language or (existing or {}).get("language") or me.get("review_language") or "en",
+            "acquisition": normalize_acquisition(acquisition) if acquisition else (existing or {}).get("acquisition") or (row or {}).get("acquisition") or "purchase",
+            "completion": normalize_completion(completion) if completion else (existing or {}).get("completion") or (row or {}).get("completion") or "unfinished",
+            "playtime": (existing or {}).get("playtime") or (row or {}).get("playtime") or 0,
+            "score": int(review_score) if review_score else None,
+            "spoilers": bool(spoilers),
+            "mature_content": bool(mature_content),
+            "post_feed": False,
+            "published": bool(publish),
+            "images": [],
+        }
     )
-    click = await page.evaluate(CALL_REVIEW_SAVE_JS, {"publish": publish})
-    if not click.get("clicked"):
-        names = ["PUBLISH"] if publish else ["SAVE DRAFT"]
-        click = await page.evaluate(CLICK_NAMED_BUTTON_JS, {"names": names, "forbid": "DELETE"})
-    await page.wait_for_timeout(2000)
-    after = await _fetch_ib_api(
-        page,
-        f"/reviews?user_id={ctx['user_id']}&game_id={ctx['game_id']}&published={'true' if publish else 'false'}",
-    )
+    for key in ("visual", "story", "gameplay", "sound", "accessibility"):
+        payload.setdefault(key, None)
+    if payload["platform_id"] is not None:
+        payload["platform_id"] = int(payload["platform_id"])
+    if existing:
+        result = await ib_api(page, "PUT", f"/reviews/{int(existing['id'])}", body=payload)
+    else:
+        result = await ib_api(page, "POST", "/reviews/", body=payload)
+    if not result.get("ok"):
+        return _dumps(api_error(result, "add_game_review"))
+    saved = result.get("data") or {}
     return _dumps(
         {
-            "slug": ctx["slug"],
-            "game_id": ctx["game_id"],
-            "url": page.url,
-            "existing_before": existing,
-            "fill": fill,
-            "click": click,
-            "publish": publish,
-            "after": after.get("data") if after.get("ok") else after,
+            "ok": True,
+            "game": slim_game(game),
+            "review_id": saved.get("id"),
+            "published": saved.get("published"),
+            "status": "updated" if existing else "created",
+            "chars": text_len,
+            "url": f"https://infinitebacklog.net/users/{me['username'].lower()}/reviews/{ctx['slug']}",
         }
     )
 
-async def delete_game_review(
-    slug: str,
-    confirm: bool = False,
-    published: bool = False,
-    wait_ms: int = 3000,
-) -> str:
-    """Delete a review. Drafts only unless published=true AND you named that review. confirm=true required. Never DELETE GAME."""
+
+async def delete_game_review(slug: str, confirm: bool = False, published: bool = False) -> str:
+    """Delete your review of a game. Drafts need confirm=true. A published review also needs published=true, so it is never removed by accident."""
     if not confirm:
-        return _dumps({"error": "confirm_required", "hint": "Pass confirm=true to delete a draft review."})
-    if published:
-        return _dumps(
-            profile_scope(
-                "published_review",
-                "Pass published=true only after naming the published review in chat. Default is draft-only.",
-            )
-        )
+        return _dumps({"error": "confirm_required", "hint": "Pass confirm=true to delete the review."})
     page = await _ensure_browser()
-    ctx = await _resolve_game_context(page, slug, "", wait_ms)
-    if not ctx.get("game_id"):
-        return _dumps({"error": "game_not_found", "slug": ctx.get("slug")})
-    await _goto_ib(page, f"/users/{ctx['username']}/reviews/{ctx['slug']}", wait_ms)
-    body = " ".join((await page.inner_text("body")).split())[:800]
-    if "DELETE DRAFT" not in body and "This review is a draft" not in body:
+    ctx = await game_context(page, slug, need_row=False)
+    if ctx.get("error"):
+        return _dumps(ctx)
+    existing = await _my_review(page, ctx["user"], ctx["slug"])
+    if not existing:
+        return _dumps({"ok": True, "status": "no_review"})
+    if existing.get("published") and not published:
         return _dumps(
             {
-                "error": "not_a_draft",
-                "url": page.url,
-                "hint": "No DELETE DRAFT on this page. Will not delete a published review unless you name it.",
+                "error": "profile_scope",
+                "reason": "published_review",
+                "hint": "This review is published. Pass published=true as well to delete it.",
             }
         )
-    click = await page.evaluate(CLICK_EXACT_BUTTON_JS, {"exact": "DELETE DRAFT", "forbid": "DELETE GAME"})
-    await page.wait_for_timeout(800)
-    confirm_click = await page.evaluate(
-        CLICK_NAMED_BUTTON_JS,
-        {"names": ["YES", "CONFIRM", "DELETE", "DELETE DRAFT"], "forbid": "GAME"},
-    )
-    await page.wait_for_timeout(2000)
-    return _dumps({"slug": ctx["slug"], "click": click, "confirm": confirm_click, "url": page.url})
+    result = await ib_api(page, "DELETE", f"/reviews/{int(existing['id'])}")
+    if not result.get("ok"):
+        return _dumps(api_error(result, "delete_game_review"))
+    return _dumps({"ok": True, "status": "deleted", "review_id": existing.get("id"), "was_published": bool(existing.get("published"))})
 
 
 def register(mcp) -> None:
